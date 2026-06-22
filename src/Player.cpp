@@ -109,6 +109,11 @@ void Player::mixAudio(void* output, ma_uint32 frameCount) {
     ma_uint64 framesRead = 0;
     ma_decoder_read_pcm_frames(decoder_, out, frameCount, &framesRead);
 
+    // Publish the new position so the UI can read it without ever locking.
+    ma_uint64 cursor = 0;
+    ma_decoder_get_cursor_in_pcm_frames(decoder_, &cursor);
+    cursorFrames_.store(cursor);
+
     if (framesRead < frameCount) {
         // Reached the end of the song: pad the rest with silence and signal the
         // main loop (via tick()) to advance. We do NOT touch playlist state on
@@ -160,6 +165,8 @@ void Player::unloadDecoder() {
         atEnd_.store(false);
         old = decoder_;
         decoder_ = nullptr;
+        cursorFrames_.store(0);
+        lengthFrames_.store(0);
     }
     if (old != nullptr) {
         ma_decoder_uninit(old);
@@ -190,6 +197,18 @@ void Player::loadAndStart(Song* song) {
         return; // leaves the previous decoder untouched
     }
 
+    // Resolve the total length ONCE, here on the main thread (off the audio
+    // hot path). For VBR/MP3 files, ma_decoder_get_length_in_pcm_frames can
+    // scan a large chunk of the file -- doing that per UI frame under the audio
+    // lock is exactly what made heavy songs stutter. We prefer the duration
+    // already known from the library metadata and only fall back to scanning
+    // the decoder when it is missing, then rewind so playback starts at 0.
+    ma_uint64 totalFrames = 0;
+    if (song->getDuration() <= 0) {
+        ma_decoder_get_length_in_pcm_frames(fresh, &totalFrames);
+        ma_decoder_seek_to_pcm_frame(fresh, 0);
+    }
+
     // Swap in the new decoder under the lock (pointer swap only -> the audio
     // thread never observes a partially built decoder), then free the old one
     // outside the lock. Only one decoder is ever alive at a time, so memory
@@ -201,6 +220,8 @@ void Player::loadAndStart(Song* song) {
         decoder_ = fresh;
         atEnd_.store(false);
         playing_.store(true);
+        cursorFrames_.store(0);
+        lengthFrames_.store(totalFrames);
     }
     if (old != nullptr) {
         ma_decoder_uninit(old);
@@ -295,6 +316,7 @@ void Player::stop() {
         if (decoder_ != nullptr) {
             ma_decoder_seek_to_pcm_frame(decoder_, 0);
         }
+        cursorFrames_.store(0);
     }
     state_ = PlayerState::STOPPED;
 }
@@ -363,27 +385,25 @@ void Player::tick() {
 }
 
 float Player::getCursorSec() const {
-    std::lock_guard<std::mutex> lock(audioMutex_);
-    if (decoder_ == nullptr || sampleRate_ == 0) {
+    // Lock-free: just read the position the audio thread last published. The UI
+    // calls this every frame, so it must never contend the audio lock.
+    if (sampleRate_ == 0) {
         return 0.0f;
     }
-    ma_uint64 frames = 0;
-    ma_decoder_get_cursor_in_pcm_frames(decoder_, &frames);
-    return static_cast<float>(frames) / static_cast<float>(sampleRate_);
+    return static_cast<float>(cursorFrames_.load()) / static_cast<float>(sampleRate_);
 }
 
 int Player::getDurationSec() const {
-    {
-        std::lock_guard<std::mutex> lock(audioMutex_);
-        if (decoder_ != nullptr && sampleRate_ > 0) {
-            ma_uint64 frames = 0;
-            if (ma_decoder_get_length_in_pcm_frames(decoder_, &frames) == MA_SUCCESS &&
-                frames > 0) {
-                return static_cast<int>(frames / sampleRate_);
-            }
-        }
+    // Prefer the library metadata duration (always cheap); fall back to the
+    // length cached at load time. Never queries the decoder on the hot path.
+    if (currentSong_ != nullptr && currentSong_->getDuration() > 0) {
+        return currentSong_->getDuration();
     }
-    return currentSong_ != nullptr ? currentSong_->getDuration() : 0;
+    const ma_uint64 frames = lengthFrames_.load();
+    if (frames > 0 && sampleRate_ > 0) {
+        return static_cast<int>(frames / sampleRate_);
+    }
+    return 0;
 }
 
 std::string Player::getTimeString() const {
@@ -398,13 +418,12 @@ void Player::seekBy(int seconds) {
         if (decoder_ == nullptr || !deviceReady_) {
             return;
         }
-        ma_uint64 cursor = 0;
-        ma_uint64 length = 0;
-        ma_decoder_get_cursor_in_pcm_frames(decoder_, &cursor);
-        ma_decoder_get_length_in_pcm_frames(decoder_, &length);
+        ma_uint64 cursor = cursorFrames_.load();
+        ma_uint64 length = lengthFrames_.load();
 
-        // Fall back to the library duration if the decoder cannot report a
-        // length, so seeking still has a sane upper bound.
+        // Fall back to the library duration if no decoder length is cached, so
+        // seeking still has a sane upper bound. (We avoid querying the decoder
+        // length here too, since that can be slow for VBR/MP3 files.)
         if (length == 0) {
             const int durSec = currentSong_ != nullptr ? currentSong_->getDuration() : 0;
             length = static_cast<ma_uint64>(durSec) * sampleRate_;
@@ -420,6 +439,7 @@ void Player::seekBy(int seconds) {
             reachedEnd = true; // handle outside the lock (next() re-locks)
         } else {
             ma_decoder_seek_to_pcm_frame(decoder_, static_cast<ma_uint64>(newFrame));
+            cursorFrames_.store(static_cast<ma_uint64>(newFrame));
         }
     }
     // next() acquires audioMutex_ again, so it MUST be called after releasing

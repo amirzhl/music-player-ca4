@@ -128,4 +128,11 @@ private:
     mutable std::mutex audioMutex_;
     std::atomic<bool> playing_{false}; // should the callback pull frames?
     std::atomic<bool> atEnd_{false};   // set by the callback when a song ends
+
+    // Lock-free playback position/length, published by the audio thread (and by
+    // seek/stop on the main thread) and read by the UI. Keeping the per-frame
+    // time display out of audioMutex_ means the UI never blocks the audio
+    // callback -- which is what made heavy (high-bitrate/VBR) files stutter.
+    std::atomic<ma_uint64> cursorFrames_{0};
+    std::atomic<ma_uint64> lengthFrames_{0};
 };
