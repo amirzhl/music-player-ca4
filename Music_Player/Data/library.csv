@@ -1,0 +1,22 @@
+# library.csv - one song per line
+title,artist,album,genre,year,duration_sec,file_path
+Ageh Yeh Rooz,Faramarz Aslani,Age Yeh Rooz,Persian Pop,1977,240,Data/Musics/01 Faramarz Aslani - Age Ye Rooz.mp3
+Almost Blue,Chet Baker,Almost Blue,Jazz,1988,219,Data/Musics/03 Chet Baker - Almost Blue.mp3
+Cherish the Day,Sade,Lover's Rock,Soul / R&B,1992,361,Data/Musics/Sade - Cherish the Day.mp3
+Dracula,Tame Impala,Deadbeat,Electropop,2025,205,Data/Musics/Tame Impala - Dracula.mp3
+Fantaisie-Impromptu in C-Sharp Minor Op. 66,Daniil Trifonov,Chopin Evocations,Classical,2017,300,Data/Musics/Daniil Trifonov - Fantaisie-Impromptu In C Sharp Minor - Op.mp3
+Hey You,Pink Floyd,The Wall,Progressive Rock,1979,278,Data/Musics/01 Pink Floyd - Hey You.mp3
+I Was Made for Lovin' You,Kiss,Dynasty,Hard Rock,1979,270,Data/Musics/01 Kiss - I Was Made For Lovin  You.mp3
+Lose Yourself to Dance,Daft Punk,Random Access Memories,Funk / Electronic,2013,353,Data/Musics/06 Daft Punk - Lose Yourself to Dance.mp3
+Love Tonight (Edit),Shouse,Love Tonight,Electronic / House,2017,241,Data/Musics/Shouse - Love Tonight (Edit).mp3
+Midnight Blues,Gary Moore,Still Got the Blues,Blues Rock,1990,391,Data/Musics/09 Gary Moore - Midnight Blues.mp3
+Passacaglia,Georg Friedrich Haendel / Johan Halvorsen,The Piano,Classical,2002,395,Data/Musics/11_Passacaglia_Georg_Friedrich_Haendel_Johan_Halvorsen_The_Piano.mp3
+Serenade,Eugene Ormandy,Serenade,Classical,1960,600,Data/Musics/04 Eugene Ormandy - Serenade.mp3
+Slavonic Dance in E minor Op. 72 No. 2,London Symphony Orchestra,Slavonic Dances,Classical,1878,296,Data/Musics/London Symphony Orchestra - Slavonic Dance in E minor - Op. 7.mp3
+Smalltown Boy,Bronski Beat,The Age of Consent,Synth-pop,1984,318,Data/Musics/Bronski Beat - Smalltown Boy.mp3
+Stairway to Heaven,Led Zeppelin,Led Zeppelin IV,Rock,1971,482,Data/Musics/04 Led Zeppelin - Stairway to Heaven (Remaster).mp3
+The Sails of Charon,Scorpions,Taken by Force,Hard Rock,1977,281,Data/Musics/05. The Sails Of Charon - Scorpions.mp3
+Waltz No. 2,The City of Prague Philharmonic Orchestra,The Essential Film Music Collection,Waltz,1997,240,Data/Musics/The City of Prague Philharmonic Orchestra - Waltz No 2 From.mp3
+We Are the Champions,Queen,News of the World,Classic Rock,1977,181,Data/Musics/02 Queen - We Are The Champions (Remastered 2011).mp3
+When a Blind Man Cries,Deep Purple,Machine Head (Remastered),Melodic Rock,1972,262,Data/Musics/18_When_A_Blind_Man_Cries_Remastered_Deep_Purple_320.mp3
+You Won't Come Around,Balthazar,Sand,Indie Pop,2021,320,Data/Musics/Balthazar - You Won t Come Around.mp3

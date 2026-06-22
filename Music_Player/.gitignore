@@ -1,0 +1,12 @@
+# Build artifacts
+*.o
+*.obj
+music_player
+music_player.exe
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
