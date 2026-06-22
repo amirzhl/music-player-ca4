@@ -92,8 +92,14 @@ void Player::loadAndStart(Song* song) {
     if (song == nullptr) {
         return;
     }
+    // MA_SOUND_FLAG_STREAM: decode on the fly instead of loading the whole
+    // file into memory up front. Without this, every track change fully
+    // decodes a multi-minute MP3 synchronously, which blocks the main loop --
+    // pressing next/previous several times in a row stacks those decodes and
+    // freezes the program. Streaming makes track changes near-instant.
     const ma_result result = ma_sound_init_from_file(
-        &engine_, song->getFilePath().c_str(), 0, nullptr, nullptr, &sound_);
+        &engine_, song->getFilePath().c_str(), MA_SOUND_FLAG_STREAM, nullptr,
+        nullptr, &sound_);
     if (result != MA_SUCCESS) {
         soundLoaded_ = false;
         message_ = "Could not decode audio file: " + song->getFilePath();
@@ -113,18 +119,25 @@ bool Player::startAt(int index) {
         return false;
     }
 
-    // Normalise and try up to n songs, skipping those with missing files.
+    // Normalise and try up to n songs, skipping those that cannot be played.
     int idx = ((index % n) + n) % n;
     for (int attempt = 0; attempt < n; ++attempt) {
         Song* song = songs_[idx];
         if (song != nullptr && fileExists(song->getFilePath())) {
-            currentIndex_ = idx;
-            currentSong_ = song;
             loadAndStart(song);
-            state_ = PlayerState::PLAYING;
-            return true;
-        }
-        if (song != nullptr) {
+            // Only treat the song as "playing" if it actually loaded -- or if we
+            // are in silent mode (no audio device), where the state machine
+            // still runs without sound. A file that exists but fails to decode
+            // is skipped just like a missing one, so a single bad track can
+            // never freeze playback on a "PLAYING" screen that never advances.
+            if (soundLoaded_ || !engineReady_) {
+                currentIndex_ = idx;
+                currentSong_ = song;
+                state_ = PlayerState::PLAYING;
+                return true;
+            }
+            message_ = "Could not decode audio file, skipping: " + song->getFilePath();
+        } else if (song != nullptr) {
             message_ = "Audio file not found, skipping: " + song->getFilePath();
         }
         idx = (idx + 1) % n;
@@ -151,7 +164,13 @@ void Player::play() {
     const ma_uint64 frame = resumeFrame_;
     resumePending_ = false;
     if (startAt(idx) && resume && soundLoaded_) {
-        ma_sound_seek_to_pcm_frame(&sound_, frame);
+        // Never seek past the end -- that would leave the track instantly
+        // finished and play nothing.
+        ma_uint64 length = 0;
+        ma_sound_get_length_in_pcm_frames(&sound_, &length);
+        if (length == 0 || frame < length) {
+            ma_sound_seek_to_pcm_frame(&sound_, frame);
+        }
     }
 }
 
@@ -178,12 +197,26 @@ void Player::resume() {
 void Player::stop() {
     if (soundLoaded_) {
         // Remember the current position so a following play() resumes from here
-        // rather than restarting the track from the beginning.
+        // rather than restarting the track -- but only when we are genuinely
+        // mid-track. If the song already reached its end (e.g. the playlist
+        // finished), forget the position so the next play() starts cleanly
+        // from the beginning instead of resuming at the very end (which would
+        // play nothing and look like a freeze).
         ma_uint64 cursor = 0;
+        ma_uint64 length = 0;
         ma_sound_get_cursor_in_pcm_frames(&sound_, &cursor);
-        resumeFrame_ = cursor;
-        resumePending_ = (cursor > 0);
+        ma_sound_get_length_in_pcm_frames(&sound_, &length);
+        if (length > 0 && cursor > 0 && cursor < length) {
+            resumeFrame_ = cursor;
+            resumePending_ = true;
+        } else {
+            resumeFrame_ = 0;
+            resumePending_ = false;
+        }
         ma_sound_stop(&sound_);
+    } else {
+        resumeFrame_ = 0;
+        resumePending_ = false;
     }
     state_ = PlayerState::STOPPED;
 }
@@ -293,12 +326,19 @@ void Player::seekBy(int seconds) {
     ma_sound_get_length_in_pcm_frames(&sound_, &length);
     const ma_uint32 rate = ma_engine_get_sample_rate(&engine_);
 
+    // Streamed sounds may not report a length immediately; fall back to the
+    // duration stored in the library so seeking still has a sane upper bound.
+    if (length == 0) {
+        const int durSec = currentSong_ != nullptr ? currentSong_->getDuration() : 0;
+        length = static_cast<ma_uint64>(durSec) * rate;
+    }
+
     ma_int64 newFrame = static_cast<ma_int64>(cursor) +
                         static_cast<ma_int64>(seconds) * static_cast<ma_int64>(rate);
     if (newFrame < 0) {
         newFrame = 0;
     }
-    if (static_cast<ma_uint64>(newFrame) >= length) {
+    if (length > 0 && static_cast<ma_uint64>(newFrame) >= length) {
         next();
         return;
     }
