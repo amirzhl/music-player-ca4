@@ -5,7 +5,7 @@
 
 #include "Player.h"
 
-#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <random>
@@ -32,24 +32,98 @@ int randomIndex(int count, int exclude) {
 } // namespace
 
 Player::Player() {
-    engineReady_ = (ma_engine_init(nullptr, &engine_) == MA_SUCCESS);
-    if (!engineReady_) {
+    // Create the playback device ONCE. It stays alive (and running) for the
+    // whole lifetime of the player; track changes never touch the device, only
+    // the decoder it reads from. Forcing a fixed output format means every
+    // decoder is configured to match it, so no per-track device juggling is
+    // needed.
+    ma_device_config config = ma_device_config_init(ma_device_type_playback);
+    config.playback.format = ma_format_f32;
+    config.playback.channels = channels_;
+    config.sampleRate = sampleRate_;
+    config.dataCallback = &Player::dataCallback;
+    config.pUserData = this;
+
+    if (ma_device_init(nullptr, &config, &device_) == MA_SUCCESS) {
+        // Keep the device running for the whole session. The callback simply
+        // outputs silence whenever nothing is playing.
+        deviceReady_ = (ma_device_start(&device_) == MA_SUCCESS);
+        if (!deviceReady_) {
+            ma_device_uninit(&device_);
+        }
+    }
+
+    if (!deviceReady_) {
         // No usable audio backend/device was found (typical on WSL, plain SSH
         // sessions, containers, or VMs without a sound device). The player
         // still runs as a complete state machine -- it just makes no sound.
-        std::cerr << "[audio] could not initialise the audio engine -- "
+        std::cerr << "[audio] could not initialise an audio device -- "
                      "running in silent mode (no audio device detected).\n";
     }
 }
 
 Player::~Player() {
-    unloadSound();
-    if (engineReady_) {
-        ma_engine_uninit(&engine_);
-        engineReady_ = false;
+    // Stop the device FIRST. ma_device_uninit() stops and joins the audio
+    // thread, so once it returns the callback can no longer run -- only then is
+    // it safe to free the decoder it was reading from. This ordering is what
+    // guarantees a clean shutdown with no lingering process.
+    if (deviceReady_) {
+        ma_device_uninit(&device_);
+        deviceReady_ = false;
+    }
+    if (decoder_ != nullptr) {
+        ma_decoder_uninit(decoder_);
+        delete decoder_;
+        decoder_ = nullptr;
     }
 }
 
+// ---------------------------------------------------------------------------
+// Audio thread
+// ---------------------------------------------------------------------------
+void Player::dataCallback(ma_device* device, void* output, const void* input,
+                          ma_uint32 frameCount) {
+    (void)input;
+    auto* self = static_cast<Player*>(device->pUserData);
+    if (self != nullptr) {
+        self->mixAudio(output, frameCount);
+    }
+}
+
+void Player::mixAudio(void* output, ma_uint32 frameCount) {
+    const std::size_t totalSamples =
+        static_cast<std::size_t>(frameCount) * channels_;
+    auto* out = static_cast<float*>(output);
+
+    // Short, bounded critical section: read frames from the current decoder.
+    // The main thread only ever swaps decoder_ (and frees the old one) while
+    // holding this same lock, so the pointer we read here is always valid for
+    // the duration of the call.
+    std::lock_guard<std::mutex> lock(audioMutex_);
+
+    if (!playing_.load() || decoder_ == nullptr) {
+        std::memset(out, 0, totalSamples * sizeof(float));
+        return;
+    }
+
+    ma_uint64 framesRead = 0;
+    ma_decoder_read_pcm_frames(decoder_, out, frameCount, &framesRead);
+
+    if (framesRead < frameCount) {
+        // Reached the end of the song: pad the rest with silence and signal the
+        // main loop (via tick()) to advance. We do NOT touch playlist state on
+        // the audio thread -- that stays entirely on the main thread.
+        std::memset(out + framesRead * channels_, 0,
+                    static_cast<std::size_t>(frameCount - framesRead) *
+                        channels_ * sizeof(float));
+        playing_.store(false);
+        atEnd_.store(true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 bool Player::fileExists(const std::string& path) const {
     std::error_code ec;
     return std::filesystem::exists(path, ec);
@@ -61,7 +135,6 @@ void Player::setPlaylist(const std::vector<Song*>& songs, const std::string& nam
     playlistName_ = name;
     currentIndex_ = -1;
     currentSong_ = nullptr;
-    resumePending_ = false;
 }
 
 void Player::selectByPath(const std::string& filePath) {
@@ -70,43 +143,69 @@ void Player::selectByPath(const std::string& filePath) {
             currentIndex_ = static_cast<int>(i);
             currentSong_ = songs_[i];
             state_ = PlayerState::STOPPED;
-            resumePending_ = false;
             return;
         }
     }
 }
 
-void Player::unloadSound() {
-    if (soundLoaded_) {
-        ma_sound_uninit(&sound_);
-        soundLoaded_ = false;
+void Player::unloadDecoder() {
+    // Detach the current decoder under the lock so the audio thread can never
+    // be mid-read on it, then free it OUTSIDE the lock. Because the device is
+    // never destroyed here, there is no teardown handshake with the backend to
+    // deadlock on -- swapping a passive data source is always safe and fast.
+    ma_decoder* old = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audioMutex_);
+        playing_.store(false);
+        atEnd_.store(false);
+        old = decoder_;
+        decoder_ = nullptr;
+    }
+    if (old != nullptr) {
+        ma_decoder_uninit(old);
+        delete old;
     }
 }
 
 void Player::loadAndStart(Song* song) {
-    unloadSound();
-    if (!engineReady_) {
-        message_ = "Audio engine unavailable -- playing in silent mode.";
-        return;
-    }
     if (song == nullptr) {
+        unloadDecoder();
         return;
     }
-    // MA_SOUND_FLAG_STREAM: decode on the fly instead of loading the whole
-    // file into memory up front. Without this, every track change fully
-    // decodes a multi-minute MP3 synchronously, which blocks the main loop --
-    // pressing next/previous several times in a row stacks those decodes and
-    // freezes the program. Streaming makes track changes near-instant.
-    const ma_result result = ma_sound_init_from_file(
-        &engine_, song->getFilePath().c_str(), MA_SOUND_FLAG_STREAM, nullptr,
-        nullptr, &sound_);
+    if (!deviceReady_) {
+        message_ = "Audio device unavailable -- playing in silent mode.";
+        return;
+    }
+
+    // Open the new decoder BEFORE touching the live one, configured to match
+    // the device's output format so no per-track conversion juggling is needed.
+    ma_decoder_config config =
+        ma_decoder_config_init(ma_format_f32, channels_, sampleRate_);
+    auto* fresh = new ma_decoder();
+    const ma_result result =
+        ma_decoder_init_file(song->getFilePath().c_str(), &config, fresh);
     if (result != MA_SUCCESS) {
-        soundLoaded_ = false;
+        delete fresh;
         message_ = "Could not decode audio file: " + song->getFilePath();
-        return;
+        return; // leaves the previous decoder untouched
     }
-    soundLoaded_ = true;
-    ma_sound_start(&sound_);
+
+    // Swap in the new decoder under the lock (pointer swap only -> the audio
+    // thread never observes a partially built decoder), then free the old one
+    // outside the lock. Only one decoder is ever alive at a time, so memory
+    // stays bounded to a single track and there is no leak.
+    ma_decoder* old = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audioMutex_);
+        old = decoder_;
+        decoder_ = fresh;
+        atEnd_.store(false);
+        playing_.store(true);
+    }
+    if (old != nullptr) {
+        ma_decoder_uninit(old);
+        delete old;
+    }
 }
 
 bool Player::startAt(int index) {
@@ -124,13 +223,16 @@ bool Player::startAt(int index) {
     for (int attempt = 0; attempt < n; ++attempt) {
         Song* song = songs_[idx];
         if (song != nullptr && fileExists(song->getFilePath())) {
+            const bool wasLoaded = (decoder_ != nullptr);
             loadAndStart(song);
-            // Only treat the song as "playing" if it actually loaded -- or if we
-            // are in silent mode (no audio device), where the state machine
-            // still runs without sound. A file that exists but fails to decode
-            // is skipped just like a missing one, so a single bad track can
-            // never freeze playback on a "PLAYING" screen that never advances.
-            if (soundLoaded_ || !engineReady_) {
+            const bool nowLoaded = (decoder_ != nullptr);
+            // Treat the song as "playing" if a decoder actually loaded -- or if
+            // we are in silent mode (no device), where the state machine still
+            // runs without sound. A file that exists but fails to decode is
+            // skipped just like a missing one, so one bad track can never
+            // freeze playback on a "PLAYING" screen that never advances.
+            const bool decoded = nowLoaded && (nowLoaded != wasLoaded || playing_.load());
+            if (decoded || !deviceReady_) {
                 currentIndex_ = idx;
                 currentSong_ = song;
                 state_ = PlayerState::PLAYING;
@@ -149,7 +251,6 @@ bool Player::startAt(int index) {
 }
 
 bool Player::playIndex(int index) {
-    resumePending_ = false; // an explicit pick always starts from the top
     return startAt(index);
 }
 
@@ -158,29 +259,19 @@ void Player::play() {
         message_ = "Playlist is empty.";
         return;
     }
-    // Resume from where the song was stopped (if any) instead of restarting it.
+    // Per the project spec, "play" starts the current song from the beginning.
+    // Continuing from a paused position is handled by resume(), not play().
     const int idx = currentIndex_ < 0 ? 0 : currentIndex_;
-    const bool resume = resumePending_ && currentIndex_ >= 0;
-    const ma_uint64 frame = resumeFrame_;
-    resumePending_ = false;
-    if (startAt(idx) && resume && soundLoaded_) {
-        // Never seek past the end -- that would leave the track instantly
-        // finished and play nothing.
-        ma_uint64 length = 0;
-        ma_sound_get_length_in_pcm_frames(&sound_, &length);
-        if (length == 0 || frame < length) {
-            ma_sound_seek_to_pcm_frame(&sound_, frame);
-        }
-    }
+    startAt(idx);
 }
 
 void Player::pause() {
     if (state_ != PlayerState::PLAYING) {
         return; // silently ignored when nothing is playing
     }
-    if (soundLoaded_) {
-        ma_sound_stop(&sound_);
-    }
+    // Just tell the callback to stop pulling frames; the decoder cursor stays
+    // exactly where it is, so resume() continues from the same spot.
+    playing_.store(false);
     state_ = PlayerState::PAUSED;
 }
 
@@ -188,35 +279,22 @@ void Player::resume() {
     if (state_ != PlayerState::PAUSED) {
         return; // silently ignored
     }
-    if (soundLoaded_) {
-        ma_sound_start(&sound_);
+    if (decoder_ != nullptr) {
+        playing_.store(true);
     }
     state_ = PlayerState::PLAYING;
 }
 
 void Player::stop() {
-    if (soundLoaded_) {
-        // Remember the current position so a following play() resumes from here
-        // rather than restarting the track -- but only when we are genuinely
-        // mid-track. If the song already reached its end (e.g. the playlist
-        // finished), forget the position so the next play() starts cleanly
-        // from the beginning instead of resuming at the very end (which would
-        // play nothing and look like a freeze).
-        ma_uint64 cursor = 0;
-        ma_uint64 length = 0;
-        ma_sound_get_cursor_in_pcm_frames(&sound_, &cursor);
-        ma_sound_get_length_in_pcm_frames(&sound_, &length);
-        if (length > 0 && cursor > 0 && cursor < length) {
-            resumeFrame_ = cursor;
-            resumePending_ = true;
-        } else {
-            resumeFrame_ = 0;
-            resumePending_ = false;
+    // Per the project spec: "stop" halts playback AND resets the position to
+    // zero, so the next play() begins the song from the start.
+    {
+        std::lock_guard<std::mutex> lock(audioMutex_);
+        playing_.store(false);
+        atEnd_.store(false);
+        if (decoder_ != nullptr) {
+            ma_decoder_seek_to_pcm_frame(decoder_, 0);
         }
-        ma_sound_stop(&sound_);
-    } else {
-        resumeFrame_ = 0;
-        resumePending_ = false;
     }
     state_ = PlayerState::STOPPED;
 }
@@ -259,12 +337,10 @@ void Player::next() {
     }
     const int idx = pickNextIndex();
     if (idx < 0) {
-        // NO_REPEAT past the last song: stop at the end (no resume).
+        // NO_REPEAT past the last song: stop at the end.
         stop();
-        resumePending_ = false;
         return;
     }
-    resumePending_ = false;
     startAt(idx);
 }
 
@@ -272,40 +348,39 @@ void Player::previous() {
     if (songs_.empty()) {
         return;
     }
-    resumePending_ = false;
     startAt(pickPrevIndex());
 }
 
 void Player::tick() {
-    if (state_ != PlayerState::PLAYING || !soundLoaded_) {
+    if (state_ != PlayerState::PLAYING) {
         return;
     }
-    if (ma_sound_at_end(&sound_)) {
-        // Song finished: advance based on the active playback mode.
+    // The audio thread sets atEnd_ when the current song runs out. We react on
+    // the main thread so all playlist/state changes stay single-threaded.
+    if (atEnd_.exchange(false)) {
         next();
     }
 }
 
 float Player::getCursorSec() const {
-    if (!soundLoaded_ || !engineReady_) {
+    std::lock_guard<std::mutex> lock(audioMutex_);
+    if (decoder_ == nullptr || sampleRate_ == 0) {
         return 0.0f;
     }
     ma_uint64 frames = 0;
-    ma_sound_get_cursor_in_pcm_frames(const_cast<ma_sound*>(&sound_), &frames);
-    const ma_uint32 rate = ma_engine_get_sample_rate(const_cast<ma_engine*>(&engine_));
-    if (rate == 0) {
-        return 0.0f;
-    }
-    return static_cast<float>(frames) / static_cast<float>(rate);
+    ma_decoder_get_cursor_in_pcm_frames(decoder_, &frames);
+    return static_cast<float>(frames) / static_cast<float>(sampleRate_);
 }
 
 int Player::getDurationSec() const {
-    if (soundLoaded_ && engineReady_) {
-        ma_uint64 frames = 0;
-        ma_sound_get_length_in_pcm_frames(const_cast<ma_sound*>(&sound_), &frames);
-        const ma_uint32 rate = ma_engine_get_sample_rate(const_cast<ma_engine*>(&engine_));
-        if (rate > 0 && frames > 0) {
-            return static_cast<int>(frames / rate);
+    {
+        std::lock_guard<std::mutex> lock(audioMutex_);
+        if (decoder_ != nullptr && sampleRate_ > 0) {
+            ma_uint64 frames = 0;
+            if (ma_decoder_get_length_in_pcm_frames(decoder_, &frames) == MA_SUCCESS &&
+                frames > 0) {
+                return static_cast<int>(frames / sampleRate_);
+            }
         }
     }
     return currentSong_ != nullptr ? currentSong_->getDuration() : 0;
@@ -317,32 +392,41 @@ std::string Player::getTimeString() const {
 }
 
 void Player::seekBy(int seconds) {
-    if (!soundLoaded_ || !engineReady_) {
-        return;
-    }
-    ma_uint64 cursor = 0;
-    ma_uint64 length = 0;
-    ma_sound_get_cursor_in_pcm_frames(&sound_, &cursor);
-    ma_sound_get_length_in_pcm_frames(&sound_, &length);
-    const ma_uint32 rate = ma_engine_get_sample_rate(&engine_);
+    bool reachedEnd = false;
+    {
+        std::lock_guard<std::mutex> lock(audioMutex_);
+        if (decoder_ == nullptr || !deviceReady_) {
+            return;
+        }
+        ma_uint64 cursor = 0;
+        ma_uint64 length = 0;
+        ma_decoder_get_cursor_in_pcm_frames(decoder_, &cursor);
+        ma_decoder_get_length_in_pcm_frames(decoder_, &length);
 
-    // Streamed sounds may not report a length immediately; fall back to the
-    // duration stored in the library so seeking still has a sane upper bound.
-    if (length == 0) {
-        const int durSec = currentSong_ != nullptr ? currentSong_->getDuration() : 0;
-        length = static_cast<ma_uint64>(durSec) * rate;
-    }
+        // Fall back to the library duration if the decoder cannot report a
+        // length, so seeking still has a sane upper bound.
+        if (length == 0) {
+            const int durSec = currentSong_ != nullptr ? currentSong_->getDuration() : 0;
+            length = static_cast<ma_uint64>(durSec) * sampleRate_;
+        }
 
-    ma_int64 newFrame = static_cast<ma_int64>(cursor) +
-                        static_cast<ma_int64>(seconds) * static_cast<ma_int64>(rate);
-    if (newFrame < 0) {
-        newFrame = 0;
+        ma_int64 newFrame = static_cast<ma_int64>(cursor) +
+                            static_cast<ma_int64>(seconds) *
+                                static_cast<ma_int64>(sampleRate_);
+        if (newFrame < 0) {
+            newFrame = 0;
+        }
+        if (length > 0 && static_cast<ma_uint64>(newFrame) >= length) {
+            reachedEnd = true; // handle outside the lock (next() re-locks)
+        } else {
+            ma_decoder_seek_to_pcm_frame(decoder_, static_cast<ma_uint64>(newFrame));
+        }
     }
-    if (length > 0 && static_cast<ma_uint64>(newFrame) >= length) {
+    // next() acquires audioMutex_ again, so it MUST be called after releasing
+    // the lock above -- std::mutex is not recursive.
+    if (reachedEnd) {
         next();
-        return;
     }
-    ma_sound_seek_to_pcm_frame(&sound_, static_cast<ma_uint64>(newFrame));
 }
 
 std::string Player::consumeMessage() {

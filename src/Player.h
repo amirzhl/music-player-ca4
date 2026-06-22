@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -10,12 +12,27 @@ class Song;
 enum class PlayerState { STOPPED, PLAYING, PAUSED };
 enum class PlaybackMode { NO_REPEAT, REPEAT_ONE, REPEAT_ALL, SHUFFLE };
 
-// The playback state machine. Wraps the miniaudio engine (the only place audio
-// is touched) and exposes a clean, UI-independent control surface.
+// The playback state machine.
 //
-// Dynamic memory / RAII: the miniaudio engine is initialised in the constructor
-// and released in the destructor; the destructor is the matching free path for
-// every sound resource loaded during playback.
+// Audio architecture (rationale): a SINGLE playback device (ma_device) is
+// created once in the constructor and kept running for the whole lifetime of
+// the player. It is never re-created or torn down on a track change. Each song
+// is opened as a passive ma_decoder (a data source). Changing track only swaps
+// the *decoder* behind a short-held mutex; the always-running audio device
+// keeps pulling frames through a single callback.
+//
+// Why: the previous design used the miniaudio high-level engine and called
+// ma_sound_init/uninit on every track change. Destroying a sound while the
+// device thread was actively mixing it could deadlock inside the audio backend
+// on Windows -- the symptom was the UI freezing on "next" while audio kept
+// playing, leaving orphaned music_player.exe processes behind. By never
+// destroying the device during playback and only swapping a passive decoder
+// pointer under a brief lock, that whole class of teardown deadlocks is gone.
+//
+// Threading: every public method runs on the main thread. dataCallback() runs
+// on the audio thread. They share decoder_/playing_/atEnd_ and synchronise via
+// audioMutex_ (held only for very short, bounded sections -- never across a
+// blocking call), so there is no lock-ordering deadlock.
 class Player {
 public:
     Player();
@@ -45,9 +62,9 @@ public:
     PlaybackMode getMode() const { return mode_; }
     PlayerState getState() const { return state_; }
 
-    // True if the audio engine initialised, i.e. a usable audio device exists.
+    // True if the audio device initialised, i.e. a usable audio device exists.
     // When false, playback is silent but every other feature keeps working.
-    bool isAudioAvailable() const { return engineReady_; }
+    bool isAudioAvailable() const { return deviceReady_; }
 
     Song* getCurrentSong() const { return currentSong_; }
     bool hasSongs() const { return !songs_.empty(); }
@@ -75,10 +92,16 @@ private:
     // missing. Returns true if a song actually started.
     bool startAt(int index);
     void loadAndStart(Song* song);
-    void unloadSound();
+    void unloadDecoder();
+
     int pickNextIndex() const;
     int pickPrevIndex() const;
     bool fileExists(const std::string& path) const;
+
+    // Audio thread entry points.
+    static void dataCallback(ma_device* device, void* output, const void* input,
+                             ma_uint32 frameCount);
+    void mixAudio(void* output, ma_uint32 frameCount);
 
     std::vector<Song*> songs_;   // non-owning; owned by MusicLibrary
     std::string playlistName_;
@@ -91,13 +114,18 @@ private:
     std::string message_;
 
     // miniaudio resources.
-    ma_engine engine_{};
-    ma_sound sound_{};
-    bool engineReady_ = false;
-    bool soundLoaded_ = false;
+    // The device is created once and lives for the whole program. The decoder
+    // is heap-allocated and swapped on every track change (pointer swap only,
+    // so the audio thread never sees a half-initialised decoder).
+    ma_device device_{};
+    ma_decoder* decoder_ = nullptr;     // guarded by audioMutex_
+    bool deviceReady_ = false;
+    ma_uint32 channels_ = 2;
+    ma_uint32 sampleRate_ = 48000;
 
-    // Resume support: stop() remembers the cursor (in PCM frames) so the next
-    // play() continues from where it was stopped instead of restarting.
-    ma_uint64 resumeFrame_ = 0;
-    bool resumePending_ = false;
+    // Synchronises the main thread and the audio callback. mutable so the const
+    // time-query helpers can lock it.
+    mutable std::mutex audioMutex_;
+    std::atomic<bool> playing_{false}; // should the callback pull frames?
+    std::atomic<bool> atEnd_{false};   // set by the callback when a song ends
 };
