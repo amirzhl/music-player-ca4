@@ -5,8 +5,6 @@
 `.h`/`.cpp` جداگانه قرار دارد.
 
 ```
-Music_Player/src/miniaudio.h
-```
 
 ماکروی `MINIAUDIO_IMPLEMENTATION` فقط و فقط در `src/Player.cpp` تعریف شده است،
 پس نیازی به هیچ کار اضافه‌ای ندارید.
@@ -35,7 +33,7 @@ make clean    # پاک‌سازی فایل‌های ساخته‌شده
 Music_Player/
 ├── Makefile
 ├── README.md
-├── src/                # همه‌ی کلاس‌ها (به‌علاوه‌ی miniaudio.h که باید اضافه کنید)
+├── src/                # همه‌ی کلاس‌ها 
 └── Data/
     ├── library.csv     # کاتالوگ آهنگ‌ها
     ├── settings.cfg    # وضعیت ذخیره‌شده
